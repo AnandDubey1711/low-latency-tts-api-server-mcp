@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import contextlib
+import concurrent.futures
 import dataclasses
 import datetime
 import json
@@ -15,6 +15,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import APIRouter, FastAPI, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from low_latency_tts_service_mcp.tts import (
@@ -44,6 +45,7 @@ class WorkItem:
     message_id: str
     text: str
     voice: str
+    audio: concurrent.futures.Future[bytes]
 
 
 @dataclasses.dataclass
@@ -115,14 +117,6 @@ class SayRequest(BaseModel):
     voice: str | None = None
 
 
-class SayResponse(BaseModel):
-    """Response body for POST /say."""
-
-    message_id: str
-    status: str
-    queue_position: int
-
-
 class StatusResponse(BaseModel):
     """Response body for GET /status/{message_id}."""
 
@@ -162,9 +156,9 @@ def voices(request: Request) -> VoicesResponse:
     return VoicesResponse(voices=state.voices, default_voice=state.default_voice)
 
 
-@router.post("/say", status_code=202)
-def say(request: Request, body: SayRequest) -> SayResponse:
-    """Queue text for Kokoro speech synthesis and playback."""
+@router.post("/say")
+def say(request: Request, body: SayRequest) -> Response:
+    """Queue text for Kokoro synthesis and playback, then return the WAV once it is generated."""
     state: ServerState = request.app.state.server
 
     cleaned = clean_text(body.text)
@@ -183,7 +177,6 @@ def say(request: Request, body: SayRequest) -> SayResponse:
 
     message_id = state.next_message_id()
     state.evict_expired()
-    queue_position = state.work_queue.qsize()
 
     with state.status_lock:
         state.statuses[message_id] = MessageStatus(
@@ -195,14 +188,30 @@ def say(request: Request, body: SayRequest) -> SayResponse:
             completed_at=None,
         )
 
-    state.work_queue.put(WorkItem(message_id=message_id, text=cleaned, voice=voice))
+    item = WorkItem(message_id=message_id, text=cleaned, voice=voice, audio=concurrent.futures.Future())
+    state.work_queue.put(item)
 
     logger.debug(
         "POST /say request:\n%s",
         json.dumps({"text": body.text, "voice": voice, "message_id": message_id}, indent=2),
     )
 
-    return SayResponse(message_id=message_id, status="queued", queue_position=queue_position)
+    # Respond as soon as the WAV is generated; speaker playback continues in the background.
+    try:
+        audio = item.audio.result(timeout=state.runtime.timeout_seconds)
+    except concurrent.futures.TimeoutError as error:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Timed out after {state.runtime.timeout_seconds}s waiting for audio generation",
+        ) from error
+    except Exception as error:
+        raise HTTPException(status_code=500, detail=str(error)) from error
+
+    return Response(
+        content=audio,
+        media_type="audio/wav",
+        headers={"Content-Disposition": f'attachment; filename="{message_id}.wav"'},
+    )
 
 
 @router.get("/status/{message_id}")
@@ -226,28 +235,26 @@ def status(request: Request, message_id: str) -> StatusResponse:
     )
 
 
-def _fail_item(state: ServerState, message_id: str, error: str) -> None:
-    """Mark one queued item as failed."""
+def _fail_item(state: ServerState, item: WorkItem, error: str) -> None:
+    """Mark one queued item as failed and release its waiting request."""
     with state.status_lock:
-        message_status = state.statuses.get(message_id)
+        message_status = state.statuses.get(item.message_id)
         if message_status is not None:
             message_status.status = "error"
             message_status.error = error
             message_status.completed_at = time.time()
+    if not item.audio.done():
+        item.audio.set_exception(RuntimeError(error))
 
 
 def _start_playback(
     state: ServerState,
     player: AudioPlayer,
-    pending: tuple[WorkItem, Path, Path | None, bool],
-    playback_done: threading.Event | None,
-) -> threading.Event:
-    """Wait for prior playback, then queue the next generated WAV."""
-    if playback_done is not None:
-        playback_done.wait()
-
-    work_item, wav_path, reported_path, delete_after_playback = pending
-    done = threading.Event()
+    work_item: WorkItem,
+    generated: tuple[Path, Path | None, bool],
+) -> None:
+    """Queue a generated WAV on the player, which plays jobs in submission order."""
+    wav_path, reported_path, delete_after_playback = generated
 
     def on_complete(output_path: Path | None) -> None:
         with state.status_lock:
@@ -256,7 +263,6 @@ def _start_playback(
             message_status.audio_file = str(output_path) if output_path is not None else None
             message_status.completed_at = time.time()
         logger.debug("Playback completed for %s -> %s", work_item.message_id, output_path)
-        done.set()
 
     def on_error(error: Exception) -> None:
         logger.error("Playback failed for %s: %s", work_item.message_id, error)
@@ -265,7 +271,6 @@ def _start_playback(
             message_status.status = "error"
             message_status.error = str(error)
             message_status.completed_at = time.time()
-        done.set()
 
     with state.status_lock:
         state.statuses[work_item.message_id].status = "playing"
@@ -279,11 +284,10 @@ def _start_playback(
             on_error=on_error,
         )
     )
-    return done
 
 
 def _generate_item(state: ServerState, item: WorkItem) -> tuple[Path, Path | None, bool] | None:
-    """Generate a WAV for one work item and return playback metadata."""
+    """Generate a WAV for one work item, hand its bytes to the request, and return playback metadata."""
     output_path = make_output_path(state.output_dir)
     reported_path = output_path if state.save_wav else None
     delete_after_playback = not state.save_wav
@@ -293,51 +297,37 @@ def _generate_item(state: ServerState, item: WorkItem) -> tuple[Path, Path | Non
 
     try:
         generated_path = generate_wav(state.runtime, item.text, item.voice, output_path)
-        return generated_path, reported_path, delete_after_playback
     except (FileExistsError, RuntimeError, TimeoutError, ValueError) as error:
         logger.error("Kokoro generation failed for %s: %s", item.message_id, error)
-        _fail_item(state, item.message_id, str(error))
+        _fail_item(state, item, str(error))
         if delete_after_playback and output_path.exists():
             output_path.unlink()
         return None
 
+    # Read before playback is queued: playback deletes the file when save_wav is false.
+    item.audio.set_result(generated_path.read_bytes())
+    return generated_path, reported_path, delete_after_playback
+
 
 def server_audio_worker(state: ServerState) -> None:
-    """Background worker that generates Kokoro WAVs and plays them sequentially."""
+    """Background worker that generates Kokoro WAVs and queues them for sequential playback."""
     player = AudioPlayer(state.sample_rate, state.lead_silence_ms)
-    pending: tuple[WorkItem, Path, Path | None, bool] | None = None
-    playback_done: threading.Event | None = None
 
     try:
         while True:
-            current_item: WorkItem | None = None
+            item = state.work_queue.get()
+            if item is None:
+                break
+
             try:
-                if pending is not None:
-                    playback_done = _start_playback(state, player, pending, playback_done)
-                    pending = None
-
-                item = state.work_queue.get()
-                if item is None:
-                    if playback_done is not None:
-                        playback_done.wait()
-                    break
-
-                current_item = item
                 generated = _generate_item(state, item)
                 if generated is not None:
-                    pending = (item, generated[0], generated[1], generated[2])
-
-                state.work_queue.task_done()
+                    _start_playback(state, player, item, generated)
             except Exception as error:
                 logger.error("Audio worker caught unexpected error: %s", error, exc_info=True)
-                if current_item is not None:
-                    _fail_item(state, current_item.message_id, f"unexpected worker error: {error}")
-                    with contextlib.suppress(ValueError):
-                        state.work_queue.task_done()
-
-        if pending is not None:
-            playback_done = _start_playback(state, player, pending, playback_done)
-            playback_done.wait()
+                _fail_item(state, item, f"unexpected worker error: {error}")
+            finally:
+                state.work_queue.task_done()
     finally:
         player.close()
 

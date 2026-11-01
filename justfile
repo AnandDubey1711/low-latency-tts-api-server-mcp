@@ -166,6 +166,13 @@ check:
         exit 1; \
     fi
     @printf "\033[0;32m✓ ffmpeg is installed\033[0m\n"
+    @if ! uv run python -c "import sounddevice" >/dev/null 2>&1; then \
+        printf "\033[0;31m✗ Error: PortAudio library not found (needed by sounddevice)\033[0m\n"; \
+        printf "  Install with: sudo apt install libportaudio2 (Linux) or brew install portaudio (macOS)\n"; \
+        echo ""; \
+        exit 1; \
+    fi
+    @printf "\033[0;32m✓ PortAudio is installed\033[0m\n"
     @echo ""
 
 # Run the interactive chat

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import re
 import threading
 import time
@@ -57,6 +58,28 @@ def _make_app(state: ServerState) -> FastAPI:
     app.state.server = state
     app.include_router(router)
     return app
+
+
+def _post_say(client: TestClient, state: ServerState, body: dict[str, str]) -> tuple[Any, WorkItem]:
+    """POST /say while a stand-in worker resolves the queued item with fake WAV bytes."""
+    received: list[WorkItem] = []
+
+    def fake_worker() -> None:
+        item = state.work_queue.get(timeout=5)
+        assert isinstance(item, WorkItem)
+        received.append(item)
+        item.audio.set_result(b"RIFF fake wav")
+
+    worker = threading.Thread(target=fake_worker)
+    worker.start()
+    response = client.post("/say", json=body)
+    worker.join(timeout=5)
+    assert not worker.is_alive()
+    return response, received[0]
+
+
+def _work_item(message_id: str) -> WorkItem:
+    return WorkItem(message_id=message_id, text="Hello", voice="af_heart", audio=concurrent.futures.Future())
 
 
 class _ImmediateAudioPlayer:
@@ -118,13 +141,11 @@ def test_say_queues_work_item_with_default_voice(tmp_path: Path) -> None:
     state = _make_state(tmp_path, ["af_heart", "bm_george"], "af_heart", False, True)
     client = TestClient(_make_app(state))
 
-    response = client.post("/say", json={"text": "  Hello   world  "})
+    response, item = _post_say(client, state, {"text": "  Hello   world  "})
 
-    assert response.status_code == 202
-    data = response.json()
-    assert data["status"] == "queued"
-    item = state.work_queue.get_nowait()
-    assert isinstance(item, WorkItem)
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "audio/wav"
+    assert response.content == b"RIFF fake wav"
     assert item.text == "Hello world"
     assert item.voice == "af_heart"
 
@@ -133,11 +154,9 @@ def test_say_accepts_voice_override_and_simplifies_punctuation(tmp_path: Path) -
     state = _make_state(tmp_path, ["af_heart", "bm_george"], "af_heart", True, True)
     client = TestClient(_make_app(state))
 
-    response = client.post("/say", json={"text": "Hello, world!", "voice": "bm_george"})
+    response, item = _post_say(client, state, {"text": "Hello, world!", "voice": "bm_george"})
 
-    assert response.status_code == 202
-    item = state.work_queue.get_nowait()
-    assert isinstance(item, WorkItem)
+    assert response.status_code == 200
     assert item.text == "Hello world."
     assert item.voice == "bm_george"
 
@@ -204,7 +223,8 @@ def test_server_audio_worker_generates_and_completes_message(tmp_path: Path, mon
             error=None,
             completed_at=None,
         )
-    state.work_queue.put(WorkItem(message_id=msg_id, text="Hello", voice="af_heart"))
+    item = _work_item(msg_id)
+    state.work_queue.put(item)
     state.work_queue.put(None)
 
     worker = threading.Thread(target=server_audio_worker, args=(state,))
@@ -215,6 +235,7 @@ def test_server_audio_worker_generates_and_completes_message(tmp_path: Path, mon
     with state.status_lock:
         assert state.statuses[msg_id].status == "completed"
         assert state.statuses[msg_id].audio_file is not None
+    assert item.audio.result(timeout=0) == b"fake wav"
 
 
 def test_server_audio_worker_records_generation_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -235,7 +256,8 @@ def test_server_audio_worker_records_generation_failure(tmp_path: Path, monkeypa
             error=None,
             completed_at=None,
         )
-    state.work_queue.put(WorkItem(message_id=msg_id, text="Hello", voice="af_heart"))
+    item = _work_item(msg_id)
+    state.work_queue.put(item)
     state.work_queue.put(None)
 
     worker = threading.Thread(target=server_audio_worker, args=(state,))
@@ -246,3 +268,5 @@ def test_server_audio_worker_records_generation_failure(tmp_path: Path, monkeypa
     with state.status_lock:
         assert state.statuses[msg_id].status == "error"
         assert state.statuses[msg_id].error == "generation failed"
+    with pytest.raises(RuntimeError, match="generation failed"):
+        item.audio.result(timeout=0)

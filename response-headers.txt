@@ -1,0 +1,10 @@
+HTTP/1.1 200 OK
+date: Wed, 28 Oct 2026 07:24:37 GMT
+server: uvicorn
+content-type: audio/wav
+accept-ranges: bytes
+content-disposition: attachment; filename="msg_20261028_125437_003.wav"
+content-length: 96044
+last-modified: Wed, 28 Oct 2026 07:24:39 GMT
+etag: "adff90d37875461c5971853988c64777"
+

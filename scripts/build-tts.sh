@@ -63,9 +63,14 @@ fi
 # BLAS matmul backend changes float rounding, so the generated audio would differ
 # from the output this project was tuned against. tts-cli runs on CPU regardless
 # unless it is passed --use-metal, which this project never does.
+#
+# SDL2 is off because it only powers tts-cli's --play flag; playback happens in
+# Python via sounddevice. Left on, cmake fetches SDL2 from source, which needs
+# the X11/ALSA development headers on Linux.
 printf "\033[0;34mBuilding tts-cli and phonemize (Release, CPU)\033[0m\n"
 cmake -S "$CHECKOUT" -B "$CHECKOUT/build" \
     -DCMAKE_BUILD_TYPE=Release \
+    -DTTS_CLI_SDL=OFF \
     -DGGML_ACCELERATE=OFF \
     -DGGML_BLAS=OFF \
     -DGGML_METAL=OFF > /dev/null
